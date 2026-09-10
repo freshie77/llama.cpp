@@ -1842,7 +1842,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_expert_parallel(
     ggml_build_forward_expand(gf, weights);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
-    ggml_tensor * branch_out[2] = { nullptr, nullptr };
+    ggml_tensor * branch_outputs[2] = { nullptr, nullptr };
     for (int shard = 0; shard < 2; ++shard) {
         // The ids remain global until this point.  Each branch clamps its
         // local ids to [0,63] and zeros the weight for routes it does not own.
@@ -1867,16 +1867,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn_expert_parallel(
         expert_outputs = ggml_mul(ctx0, expert_outputs, branch_weights);
         ggml_build_forward_expand(gf, expert_outputs);
 
-        branch_out[shard] = ggml_view_2d(ctx0, expert_outputs, n_embd, n_tokens, expert_outputs->nb[2], 0);
-        ggml_build_forward_expand(gf, branch_out[shard]);
-        for (int slot = 1; slot < n_expert_used; ++slot) {
-            ggml_tensor * part = ggml_view_2d(ctx0, expert_outputs, n_embd, n_tokens, expert_outputs->nb[2], slot * expert_outputs->nb[1]);
-            branch_out[shard] = ggml_add(ctx0, branch_out[shard], part);
-            ggml_build_forward_expand(gf, branch_out[shard]);
-        }
+        branch_outputs[shard] = expert_outputs;
     }
-    ggml_tensor * moe_out = ggml_add(ctx0, branch_out[0], branch_out[1]);
-    ggml_build_forward_expand(gf, moe_out);
+
+    // Transfer the complete per-slot weighted tensors once, then reduce the
+    // slots locally.  Each slot belongs to one shard and the other branch
+    // contributes an exact zero.  This retains the stable slot order while
+    // making the cross-device operation one combine per MoE layer instead of
+    // one combine for every top-k slot.
+    ggml_tensor * combined = ggml_add(ctx0, branch_outputs[0], branch_outputs[1]);
+    ggml_build_forward_expand(gf, combined);
+    ggml_tensor * moe_out = nullptr;
+    for (int slot = 0; slot < n_expert_used; ++slot) {
+        ggml_tensor * slot_out = ggml_view_2d(ctx0, combined, n_embd, n_tokens,
+                combined->nb[2], slot * combined->nb[1]);
+        ggml_build_forward_expand(gf, slot_out);
+        moe_out = moe_out == nullptr ? slot_out : ggml_add(ctx0, moe_out, slot_out);
+        ggml_build_forward_expand(gf, moe_out);
+    }
     cb(moe_out, "ffn_moe_ep_out", il);
     return moe_out;
 }
