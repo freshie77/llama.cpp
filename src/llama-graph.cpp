@@ -1843,6 +1843,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn_expert_parallel(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     ggml_tensor * branch_outputs[2] = { nullptr, nullptr };
+    ggml_tensor * local_ids[2] = { nullptr, nullptr };
+    ggml_tensor * branch_weights[2] = { nullptr, nullptr };
+    ggml_tensor * repeated[2] = { nullptr, nullptr };
+
+    // Materialize both branches' routing/remap inputs before building either
+    // expert FFN.  In particular, GPU1's repeated activation must not be
+    // produced as a tail of GPU0's branch: concurrent scheduling needs both
+    // branch inputs to be ready before either expert graph is submitted.
     for (int shard = 0; shard < 2; ++shard) {
         // The ids remain global until this point.  Each branch clamps its
         // local ids to [0,63] and zeros the weight for routes it does not own.
@@ -1865,15 +1873,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn_expert_parallel(
                     ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -1.0f));
             local_ids_f32 = ggml_add(ctx0, local_ids_f32, ggml_scale(ctx0, not_owned, sentinel_delta));
         }
-        ggml_tensor * local_ids = ggml_cast(ctx0, local_ids_f32, GGML_TYPE_I32);
+        local_ids[shard] = ggml_cast(ctx0, local_ids_f32, GGML_TYPE_I32);
         ggml_tensor * owned = ggml_reshape_3d(ctx0, owned_f32, 1, n_expert_used, n_tokens);
-        ggml_tensor * branch_weights = ggml_mul(ctx0, weights, owned);
-        ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
-        ggml_tensor * up = build_lora_mm_id(up_exps[shard], repeated, local_ids);
-        ggml_tensor * gate = build_lora_mm_id(gate_exps[shard], repeated, local_ids);
+        branch_weights[shard] = ggml_mul(ctx0, weights, owned);
+        repeated[shard] = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
+        ggml_build_forward_expand(gf, local_ids[shard]);
+        ggml_build_forward_expand(gf, branch_weights[shard]);
+        ggml_build_forward_expand(gf, repeated[shard]);
+    }
+
+    for (int shard = 0; shard < 2; ++shard) {
+        ggml_tensor * up = build_lora_mm_id(up_exps[shard], repeated[shard], local_ids[shard]);
+        ggml_tensor * gate = build_lora_mm_id(gate_exps[shard], repeated[shard], local_ids[shard]);
         ggml_tensor * activated = ggml_swiglu_split(ctx0, gate, up);
-        ggml_tensor * expert_outputs = build_lora_mm_id(down_exps[shard], activated, local_ids);
-        expert_outputs = ggml_mul(ctx0, expert_outputs, branch_weights);
+        ggml_tensor * expert_outputs = build_lora_mm_id(down_exps[shard], activated, local_ids[shard]);
+        expert_outputs = ggml_mul(ctx0, expert_outputs, branch_weights[shard]);
         ggml_build_forward_expand(gf, expert_outputs);
 
         branch_outputs[shard] = expert_outputs;

@@ -334,6 +334,12 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
+    // Enable the fixed two-device expert-parallel scheduler extension.  When
+    // enabled, the scheduler exposes the two local expert branches as
+    // independent CUDA submissions and joins them through normal graph
+    // dependencies.  Disabled by default for all other split modes.
+    GGML_API void                 ggml_backend_sched_set_ep_concurrent(ggml_backend_sched_t sched, bool enabled);
+
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 

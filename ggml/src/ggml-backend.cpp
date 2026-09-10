@@ -774,6 +774,10 @@ struct ggml_backend_sched_split {
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    // The fixed Qwen MoE expert path has two explicitly independent device
+    // branches.  Keep this opt-in so ordinary layer/tensor scheduling keeps
+    // its existing ordering semantics.
+    bool ep_concurrent;
 
     int n_backends;
 
@@ -826,6 +830,32 @@ struct ggml_backend_sched {
     int debug_graph_size;
     int debug_prev_graph_size;
 };
+
+static bool ggml_backend_sched_is_ep_branch_node(const ggml_tensor * node) {
+    if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr || node->src[0]->ne[2] != 64 ||
+            node->src[1] == nullptr || node->src[1]->ne[2] != 1) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(node->src[0]);
+    return name != nullptr && strstr(name, "ffn_gate_exps") != nullptr;
+}
+
+static bool ggml_backend_sched_is_ep_branch_split(const ggml_backend_sched_split * split) {
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        const ggml_tensor * node = split->graph.nodes[i];
+        if (ggml_is_view_op(node->op)) {
+            continue;
+        }
+        return ggml_backend_sched_is_ep_branch_node(node);
+    }
+    return false;
+}
+
+static bool ggml_backend_sched_is_ep_branch1_prep(const ggml_tensor * node) {
+    const char * name = node == nullptr ? nullptr : ggml_get_name(node);
+    return name != nullptr && strstr(name, "ffn_moe_ep_branch1_prep") != nullptr;
+}
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
@@ -1045,6 +1075,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         int * node_backend_id = &tensor_backend_id(node);
+        if (sched->ep_concurrent && ggml_backend_sched_is_ep_branch1_prep(node)) {
+            GGML_ASSERT(sched->n_backends >= 2);
+            *node_backend_id = 1;
+            continue;
+        }
         // do not overwrite user assignments
         if (*node_backend_id == -1) {
             *node_backend_id = ggml_backend_sched_backend_id_from_cur(sched, node);
@@ -1187,6 +1222,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
         } else {
             // assigned node: upgrade to higher prio backend if possible
+            if (sched->ep_concurrent && ggml_backend_sched_is_ep_branch1_prep(node)) {
+                continue;
+            }
             for (int b = 0; b < *node_backend_id; b++) {
                 if (sched->bufts[b] == sched->bufts[*node_backend_id] && ggml_backend_supports_op(sched->backends[b], node)) {
                     bool supported = true;
@@ -1271,6 +1309,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
+            // Keep the first local EP expert op out of the router split.  The
+            // following two branch splits can then be submitted together;
+            // the router split remains a normal dependency predecessor.
+            if (sched->ep_concurrent && ggml_backend_sched_is_ep_branch_node(node) && i > split->i_start) {
+                need_new_split = true;
+            }
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -1546,7 +1590,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
-    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+    auto prepare_split = [&](int split_id) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -1674,6 +1718,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+    };
+
+    auto launch_split = [&](int split_id) -> enum ggml_status {
+        struct ggml_backend_sched_split * split = &splits[split_id];
+        ggml_backend_t split_backend = sched->backends[split->backend_id];
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1682,7 +1732,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         } else {
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
-                struct ggml_tensor * t = split->graph.nodes[j0];
+                ggml_tensor * t = split->graph.nodes[j0];
 
                 // check if the user needs data from this node
                 bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
@@ -1713,10 +1763,43 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // record the event of this copy
+        // Record completion after all graph work has been queued.  A later
+        // cross-device copy or split consumes this event asynchronously.
         if (split->n_inputs > 0) {
-            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            if (sched->events[split->backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_record(sched->events[split->backend_id][sched->cur_copy], split_backend);
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    };
+
+    for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+        const bool concurrent_ep_pair = sched->ep_concurrent && !sched->callback_eval &&
+            split_id + 1 < sched->n_splits &&
+            ggml_backend_sched_is_ep_branch_split(&splits[split_id]) &&
+            ggml_backend_sched_is_ep_branch_split(&splits[split_id + 1]) &&
+            splits[split_id].backend_id != splits[split_id + 1].backend_id;
+
+        if (concurrent_ep_pair) {
+            // Branch-1 routing preparation is assigned to GPU1 during graph
+            // placement.  Submit the two expert branches in order without a
+            // host synchronization between them.
+            prepare_split(split_id);
+            enum ggml_status ec = launch_split(split_id);
+            if (ec != GGML_STATUS_SUCCESS) {
+                return ec;
+            }
+            prepare_split(split_id + 1);
+            ec = launch_split(split_id + 1);
+            if (ec != GGML_STATUS_SUCCESS) {
+                return ec;
+            }
+            ++split_id;
+        } else {
+            prepare_split(split_id);
+            enum ggml_status ec = launch_split(split_id);
+            if (ec != GGML_STATUS_SUCCESS) {
+                return ec;
             }
         }
     }
@@ -1791,6 +1874,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
     ggml_backend_sched_reset(sched);
 
     return sched;
+}
+
+void ggml_backend_sched_set_ep_concurrent(ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    sched->ep_concurrent = enabled;
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
