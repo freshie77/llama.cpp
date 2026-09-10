@@ -1019,6 +1019,22 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
 
+    // Qwen3 MoE proof-of-concept: each branch owns complete experts 0:64 or
+    // 64:128.  The router remains global and is evaluated exactly once.
+    ggml_tensor * build_moe_ffn_expert_parallel(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+             ggml_tensor * const up_exps[2],
+             ggml_tensor * const gate_exps[2],
+             ggml_tensor * const down_exps[2],
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+         llm_ffn_op_type   type_op,
+                bool       norm_w,
+               float       w_scale,
+        llama_expert_gating_func_type gating_op,
+                 int       il) const;
+
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,

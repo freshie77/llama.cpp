@@ -78,6 +78,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -90,6 +91,42 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+// Optional, deliberately off-by-default routing telemetry for the fixed
+// expert-parallel Qwen path.  The graph gives the materialized global top-k
+// ID tensor a stable name.  Recording at the CUDA DUP boundary means the
+// telemetry observes the actual routing tensor used by both local branches,
+// rather than re-running the router on the host.
+static void ggml_cuda_ep_record_routes(const ggml_tensor * tensor, cudaStream_t stream) {
+    const char * path = getenv("LLAMA_EP_TELEMETRY_FILE");
+    if (path == nullptr || tensor == nullptr || tensor->type != GGML_TYPE_I32 ||
+            std::string(ggml_get_name(tensor)).find("ffn_moe_ep_route_ids") == std::string::npos) {
+        return;
+    }
+
+    const size_t count = ggml_nelements(tensor);
+    std::vector<int32_t> ids(count);
+    CUDA_CHECK(cudaMemcpyAsync(ids.data(), tensor->data, count*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::ofstream out(path, std::ios::app);
+    if (!out) {
+        GGML_LOG_WARN("EP telemetry: cannot open %s\n", path);
+        return;
+    }
+
+    out << "{\"tensor\":\"" << ggml_get_name(tensor) << "\",\"n_expert_used\":"
+        << tensor->ne[0] << ",\"n_tokens\":" << tensor->ne[1] << ",\"ids\":[";
+    for (size_t i = 0; i < count; ++i) {
+        if (i != 0) {
+            out << ',';
+        }
+        out << ids[i];
+    }
+    out << "]}\n";
+}
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
@@ -1932,7 +1969,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    break;
+                    // Expert-parallel branches may intentionally map
+                    // non-owned routes to the same zero-weight local
+                    // expert.  Keep every slot: top-k IDs are normally
+                    // unique, but MUL_MAT_ID is also valid with duplicates.
                 }
             }
         }
@@ -2036,6 +2076,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DUP:
             ggml_cuda_dup(ctx, dst);
+            ggml_cuda_ep_record_routes(dst, ctx.stream());
             break;
         case GGML_OP_CPY:
             ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
@@ -4952,7 +4993,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DUP:
             {
                 ggml_type src0_type = op->src[0]->type;
-                return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
+                return src0_type != GGML_TYPE_I16;
             } break;
         case GGML_OP_ARGMAX:
         case GGML_OP_COUNT_EQUAL:

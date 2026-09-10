@@ -49,9 +49,13 @@ void llama_model_qwen3moe::load_arch_tensors(llama_model_loader &) {
         // MoE branch
         const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
 
-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+        if (params.split_mode == LLAMA_SPLIT_MODE_EXPERT) {
+            create_tensor_moe_expert_shards(layer, i, n_embd, n_ff_exp, n_expert, 0);
+        } else {
+            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+        }
     }
 }
 
@@ -133,7 +137,14 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        ggml_tensor * moe_out =
+        ggml_tensor * moe_out = model.split_mode() == LLAMA_SPLIT_MODE_EXPERT ?
+            build_moe_ffn_expert_parallel(cur, model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps_ep,
+                    model.layers[il].ffn_gate_exps_ep,
+                    model.layers[il].ffn_down_exps_ep,
+                    n_expert, n_expert_used, LLM_FFN_SILU, true,
+                    hparams.expert_weights_scale,
+                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il) :
             build_moe_ffn(cur,
                     model.layers[il].ffn_gate_inp,
                     model.layers[il].ffn_up_exps,

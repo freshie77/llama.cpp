@@ -1796,6 +1796,91 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     );
 }
 
+ggml_tensor * llm_graph_context::build_moe_ffn_expert_parallel(
+         ggml_tensor * cur,
+         ggml_tensor * gate_inp,
+         ggml_tensor * const up_exps[2],
+         ggml_tensor * const gate_exps[2],
+         ggml_tensor * const down_exps[2],
+             int64_t   n_expert,
+             int64_t   n_expert_used,
+     llm_ffn_op_type   type_op,
+            bool       norm_w,
+           float       w_scale,
+    llama_expert_gating_func_type gating_op,
+             int       il) const {
+    if (n_expert != 128 || n_expert_used <= 0 || gating_op != LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX ||
+            type_op != LLM_FFN_SILU || up_exps[0] == nullptr || up_exps[1] == nullptr ||
+            gate_exps[0] == nullptr || gate_exps[1] == nullptr || down_exps[0] == nullptr || down_exps[1] == nullptr) {
+        GGML_ABORT("expert-parallel Qwen3 path received unsupported MoE tensors");
+    }
+
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+    ggml_tensor * logits = build_lora_mm(gate_inp, cur);
+    cb(logits, "ffn_moe_ep_logits", il);
+    ggml_tensor * probs = ggml_soft_max(ctx0, logits);
+    cb(probs, "ffn_moe_ep_probs", il);
+    ggml_tensor * selected = ggml_argsort_top_k(ctx0, probs, n_expert_used);
+    cb(selected, "ffn_moe_ep_topk_global", il);
+    // Materialize one copy of the global routing decision before either
+    // branch remaps it to its local 64-expert namespace.  This is also the
+    // single observation point for optional EP routing telemetry.
+    selected = ggml_dup(ctx0, selected);
+    cb(selected, "ffn_moe_ep_route_ids", il);
+    probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected);
+    cb(weights, "ffn_moe_ep_weights", il);
+    if (norm_w) {
+        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        weights = ggml_div(ctx0, weights, ggml_clamp(ctx0, ggml_sum_rows(ctx0, weights), 6.103515625e-5, INFINITY));
+        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+    }
+    if (w_scale != 0.0f && w_scale != 1.0f) {
+        weights = ggml_scale(ctx0, weights, w_scale);
+    }
+    ggml_build_forward_expand(gf, weights);
+
+    cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * branch_out[2] = { nullptr, nullptr };
+    for (int shard = 0; shard < 2; ++shard) {
+        // The ids remain global until this point.  Each branch clamps its
+        // local ids to [0,63] and zeros the weight for routes it does not own.
+        ggml_tensor * ids_f32 = ggml_cast(ctx0, selected, GGML_TYPE_F32);
+        ggml_tensor * local_ids_f32;
+        ggml_tensor * owned_f32;
+        if (shard == 0) {
+            local_ids_f32 = ggml_clamp(ctx0, ids_f32, 0.0f, 63.0f);
+            owned_f32 = ggml_step(ctx0, ggml_add1(ctx0, ggml_scale(ctx0, ids_f32, -1.0f), ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 63.5f)));
+        } else {
+            local_ids_f32 = ggml_clamp(ctx0, ggml_add1(ctx0, ids_f32, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -64.0f)), 0.0f, 63.0f);
+            owned_f32 = ggml_step(ctx0, ggml_add1(ctx0, ids_f32, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -63.5f)));
+        }
+        ggml_tensor * local_ids = ggml_cast(ctx0, local_ids_f32, GGML_TYPE_I32);
+        ggml_tensor * owned = ggml_reshape_3d(ctx0, owned_f32, 1, n_expert_used, n_tokens);
+        ggml_tensor * branch_weights = ggml_mul(ctx0, weights, owned);
+        ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
+        ggml_tensor * up = build_lora_mm_id(up_exps[shard], repeated, local_ids);
+        ggml_tensor * gate = build_lora_mm_id(gate_exps[shard], repeated, local_ids);
+        ggml_tensor * activated = ggml_swiglu_split(ctx0, gate, up);
+        ggml_tensor * expert_outputs = build_lora_mm_id(down_exps[shard], activated, local_ids);
+        expert_outputs = ggml_mul(ctx0, expert_outputs, branch_weights);
+        ggml_build_forward_expand(gf, expert_outputs);
+
+        branch_out[shard] = ggml_view_2d(ctx0, expert_outputs, n_embd, n_tokens, expert_outputs->nb[2], 0);
+        ggml_build_forward_expand(gf, branch_out[shard]);
+        for (int slot = 1; slot < n_expert_used; ++slot) {
+            ggml_tensor * part = ggml_view_2d(ctx0, expert_outputs, n_embd, n_tokens, expert_outputs->nb[2], slot * expert_outputs->nb[1]);
+            branch_out[shard] = ggml_add(ctx0, branch_out[shard], part);
+            ggml_build_forward_expand(gf, branch_out[shard]);
+        }
+    }
+    ggml_tensor * moe_out = ggml_add(ctx0, branch_out[0], branch_out[1]);
+    ggml_build_forward_expand(gf, moe_out);
+    cb(moe_out, "ffn_moe_ep_out", il);
+    return moe_out;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,

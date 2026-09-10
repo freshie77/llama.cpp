@@ -303,6 +303,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
+    // Expert-parallel local whole-expert tensors.  These are populated only
+    // for LLAMA_SPLIT_MODE_EXPERT and contain experts [0:64] and [64:128].
+    struct ggml_tensor * ffn_gate_exps_ep[2] = { nullptr, nullptr };
+    struct ggml_tensor * ffn_down_exps_ep[2] = { nullptr, nullptr };
+    struct ggml_tensor * ffn_up_exps_ep[2]   = { nullptr, nullptr };
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
     struct ggml_tensor * ffn_down_exps_b   = nullptr;
@@ -713,6 +718,9 @@ struct llama_model_base : public llama_model {
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    ggml_tensor * create_tensor_expert_shard(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags, int shard);
+    void create_tensor_moe_expert_shards(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,

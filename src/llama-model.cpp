@@ -1251,6 +1251,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const bool use_mmap_buffer = true;
 
+    if (split_mode == LLAMA_SPLIT_MODE_EXPERT) {
+        if ((arch != LLM_ARCH_QWEN3MOE && arch != LLM_ARCH_QWEN3VLMOE) || devices.size() != 2) {
+            throw std::runtime_error("expert split requires Qwen3 MoE/VL MoE with exactly two GPU devices");
+        }
+    }
+
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
@@ -2746,6 +2752,32 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
     return create_tensor(*ml, tn, ne, flags);
+}
+
+ggml_tensor * llama_model_base::create_tensor_expert_shard(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags, int shard) {
+    GGML_ASSERT(ml != nullptr);
+    if (params.split_mode != LLAMA_SPLIT_MODE_EXPERT || devices.size() != 2 || shard < 0 || shard > 1) {
+        throw std::runtime_error("expert-parallel tensor requested without exactly two expert devices");
+    }
+    const auto & dev = devices.at(shard).dev;
+    const buft_list_t * buft_list_layer = &pimpl->gpu_buft_list.at(dev);
+    return ml->create_tensor(
+        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+        tn, ne, flags, shard);
+}
+
+void llama_model_base::create_tensor_moe_expert_shards(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
+    if (params.split_mode != LLAMA_SPLIT_MODE_EXPERT) {
+        return;
+    }
+    if (n_expert_ != 128) {
+        throw std::runtime_error("expert-parallel Qwen3 v1 requires exactly 128 experts");
+    }
+    for (int shard = 0; shard < 2; ++shard) {
+        layer.ffn_gate_exps_ep[shard] = create_tensor_expert_shard(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags, shard);
+        layer.ffn_up_exps_ep[shard]   = create_tensor_expert_shard(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags, shard);
+        layer.ffn_down_exps_ep[shard] = create_tensor_expert_shard(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", bid), {n_ff_, n_embd_, n_expert_}, flags, shard);
+    }
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
