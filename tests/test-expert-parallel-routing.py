@@ -41,3 +41,13 @@ def test_invalid_route_fails_closed():
         assert "outside" in str(exc)
     else:
         raise AssertionError("invalid expert ID was accepted")
+
+
+def test_decode_local_route_uses_remote_sentinel_without_reordering_slots():
+    routes = [0, 63, 64, 127, 5, 70, 12, 99]
+    assert [MODULE.decode_local_route(expert, 0) for expert in routes] == [
+        0, 63, -1, -1, 5, -1, 12, -1
+    ]
+    assert [MODULE.decode_local_route(expert, 1) for expert in routes] == [
+        -1, -1, 0, 63, -1, 6, -1, 35
+    ]

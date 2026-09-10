@@ -33,6 +33,21 @@ def route_partition(ids: Iterable[int], n_expert_used: int) -> tuple[list[int], 
     return local, gpu0, n_expert_used - gpu0
 
 
+def decode_local_route(expert: int, shard: int) -> int:
+    """Return the decode-kernel local ID, or -1 for a remote route.
+
+    The CUDA MMVQ fast path uses -1 as a non-owning-slot sentinel. Keeping
+    this small contract in the telemetry tool makes the fixed 64/64 mapping
+    independently testable without requiring two GPUs.
+    """
+    if expert < 0 or expert >= EXPERTS:
+        raise ValueError("global expert ID outside 0..127")
+    if shard not in (0, 1):
+        raise ValueError("EP shard must be 0 or 1")
+    owner = expert // SHARD_SIZE
+    return expert % SHARD_SIZE if owner == shard else -1
+
+
 def aggregate(lines: Iterable[str]) -> dict:
     layers: dict[str, dict] = {}
     co_selection: collections.Counter[tuple[int, int]] = collections.Counter()

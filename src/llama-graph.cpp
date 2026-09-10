@@ -1850,11 +1850,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn_expert_parallel(
         ggml_tensor * local_ids_f32;
         ggml_tensor * owned_f32;
         if (shard == 0) {
-            local_ids_f32 = ggml_clamp(ctx0, ids_f32, 0.0f, 63.0f);
             owned_f32 = ggml_step(ctx0, ggml_add1(ctx0, ggml_scale(ctx0, ids_f32, -1.0f), ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 63.5f)));
+            local_ids_f32 = ggml_clamp(ctx0, ids_f32, 0.0f, 63.0f);
         } else {
             local_ids_f32 = ggml_clamp(ctx0, ggml_add1(ctx0, ids_f32, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -64.0f)), 0.0f, 63.0f);
             owned_f32 = ggml_step(ctx0, ggml_add1(ctx0, ids_f32, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -63.5f)));
+        }
+        // Decode has one token, so the CUDA MMVQ kernel can cheaply skip a
+        // routed slot whose owner is the other GPU.  Prefill keeps the valid
+        // [0,63] IDs required by the generic grouped-MATMUL paths.
+        if (n_tokens == 1) {
+            const float sentinel_delta = shard == 0 ? 64.0f : 1.0f;
+            ggml_tensor * not_owned = ggml_add1(ctx0, owned_f32,
+                    ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -1.0f));
+            local_ids_f32 = ggml_add(ctx0, local_ids_f32, ggml_scale(ctx0, not_owned, sentinel_delta));
         }
         ggml_tensor * local_ids = ggml_cast(ctx0, local_ids_f32, GGML_TYPE_I32);
         ggml_tensor * owned = ggml_reshape_3d(ctx0, owned_f32, 1, n_expert_used, n_tokens);
