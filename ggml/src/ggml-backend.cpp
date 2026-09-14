@@ -1811,6 +1811,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     };
 
     for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+        if (ggml_backend_sched_is_empty_split(&splits[split_id])) {
+            continue;
+        }
+
         // A view-only split can be inserted between the two EP branches by
         // normal graph partitioning.  It has no device work or dependency of
         // its own, so do not let it prevent the following real branch from
