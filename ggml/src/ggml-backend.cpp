@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -772,6 +775,54 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// A single reusable host worker avoids constructing two OS threads for every
+// EP branch pair while retaining the explicit join before the next scheduler
+// dependency.  The worker only owns the host-side CUDA submission call; CUDA
+// stream/event ordering remains the source of truth for device dependencies.
+struct ggml_backend_sched_ep_launch_state {
+    std::mutex mutex;
+    std::condition_variable work_available;
+    std::condition_variable work_done;
+    std::function<enum ggml_status()> task;
+    std::thread worker;
+    bool stopping = false;
+    bool has_task = false;
+    bool done = true;
+    enum ggml_status result = GGML_STATUS_SUCCESS;
+
+    ggml_backend_sched_ep_launch_state() : worker([this] {
+        for (;;) {
+            std::function<enum ggml_status()> task_to_run;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                work_available.wait(lock, [this] { return stopping || has_task; });
+                if (stopping) {
+                    return;
+                }
+                task_to_run = std::move(task);
+                has_task = false;
+            }
+
+            const enum ggml_status result_to_publish = task_to_run();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                result = result_to_publish;
+                done = true;
+            }
+            work_done.notify_one();
+        }
+    }) {}
+
+    ~ggml_backend_sched_ep_launch_state() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        work_available.notify_one();
+        worker.join();
+    }
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -779,6 +830,7 @@ struct ggml_backend_sched {
     // branches.  Keep this opt-in so ordinary layer/tensor scheduling keeps
     // its existing ordering semantics.
     bool ep_concurrent;
+    ggml_backend_sched_ep_launch_state * ep_launch_state;
 
     int n_backends;
 
@@ -1852,21 +1904,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             prepare_split(split_id);
             prepare_split(next_ep_split_id);
 
-            // Keep the scheduler thread submitting one branch while a single
-            // helper submits the sibling.  Creating two helper threads for
-            // every MoE layer adds avoidable host launch overhead without
-            // improving device concurrency.
+            // Keep the scheduler thread submitting one branch while the
+            // reusable helper submits the sibling.  The helper is joined
+            // before the scheduler advances to the dependent join/next layer.
             enum ggml_status ec0 = GGML_STATUS_SUCCESS;
-            enum ggml_status ec1 = GGML_STATUS_SUCCESS;
-            std::thread launch1([&] {
-                GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, next_ep_split_id);
-                ec1 = launch_split(next_ep_split_id);
-                GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, next_ep_split_id);
-            });
+            {
+                ggml_backend_sched_ep_launch_state * ep_launch = sched->ep_launch_state;
+                GGML_ASSERT(ep_launch != nullptr);
+                std::lock_guard<std::mutex> lock(ep_launch->mutex);
+                GGML_ASSERT(!ep_launch->has_task && ep_launch->done);
+                ep_launch->task = [&] {
+                    GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, next_ep_split_id);
+                    enum ggml_status ec = launch_split(next_ep_split_id);
+                    GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, next_ep_split_id);
+                    return ec;
+                };
+                ep_launch->done = false;
+                ep_launch->has_task = true;
+                ep_launch->work_available.notify_one();
+            }
             GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, split_id);
             ec0 = launch_split(split_id);
             GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, split_id);
-            launch1.join();
+
+            enum ggml_status ec1 = GGML_STATUS_SUCCESS;
+            {
+                std::unique_lock<std::mutex> lock(sched->ep_launch_state->mutex);
+                sched->ep_launch_state->work_done.wait(lock, [&] { return sched->ep_launch_state->done; });
+                ec1 = sched->ep_launch_state->result;
+            }
 
             if (ec0 != GGML_STATUS_SUCCESS) {
                 return ec0;
@@ -1959,6 +2025,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_set_ep_concurrent(ggml_backend_sched_t sched, bool enabled) {
     GGML_ASSERT(sched);
     sched->ep_concurrent = enabled;
+    if (enabled && sched->ep_launch_state == nullptr) {
+        sched->ep_launch_state = new ggml_backend_sched_ep_launch_state();
+    }
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
@@ -1970,6 +2039,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->events[b][c]);
         }
     }
+    delete sched->ep_launch_state;
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
