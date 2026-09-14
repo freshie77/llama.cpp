@@ -1852,19 +1852,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             prepare_split(split_id);
             prepare_split(next_ep_split_id);
 
+            // Keep the scheduler thread submitting one branch while a single
+            // helper submits the sibling.  Creating two helper threads for
+            // every MoE layer adds avoidable host launch overhead without
+            // improving device concurrency.
             enum ggml_status ec0 = GGML_STATUS_SUCCESS;
             enum ggml_status ec1 = GGML_STATUS_SUCCESS;
-            std::thread launch0([&] {
-                GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, split_id);
-                ec0 = launch_split(split_id);
-                GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, split_id);
-            });
             std::thread launch1([&] {
                 GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, next_ep_split_id);
                 ec1 = launch_split(next_ep_split_id);
                 GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, next_ep_split_id);
             });
-            launch0.join();
+            GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, split_id);
+            ec0 = launch_split(split_id);
+            GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, split_id);
             launch1.join();
 
             if (ec0 != GGML_STATUS_SUCCESS) {
