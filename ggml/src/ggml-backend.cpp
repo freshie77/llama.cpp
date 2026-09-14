@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <thread>
 #include <vector>
 
 #ifdef __APPLE__
@@ -852,6 +853,29 @@ static bool ggml_backend_sched_is_ep_branch_split(const ggml_backend_sched_split
     return false;
 }
 
+// The first ADD after the two local expert branches is the EP join.  Keep it
+// out of the second branch split so the scheduler can submit both branches
+// concurrently and let the normal cross-device input event make the join
+// wait for both results.
+static bool ggml_backend_sched_is_ep_join_node(const ggml_tensor * node) {
+    if (node == nullptr || node->op != GGML_OP_ADD) {
+        return false;
+    }
+
+    int branch_sources = 0;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * src = node->src[i];
+        const ggml_tensor * down = src != nullptr && src->op == GGML_OP_MUL ? src->src[0] : nullptr;
+        const char * down_name = down != nullptr && down->src[0] != nullptr ? ggml_get_name(down->src[0]) : nullptr;
+        if (down != nullptr && down->op == GGML_OP_MUL_MAT_ID && down_name != nullptr &&
+                strstr(down_name, "ffn_down_exps") != nullptr) {
+            ++branch_sources;
+        }
+    }
+
+    return branch_sources == 2;
+}
+
 static bool ggml_backend_sched_is_ep_branch1_prep(const ggml_tensor * node) {
     const char * name = node == nullptr ? nullptr : ggml_get_name(node);
     return name != nullptr && strstr(name, "ffn_moe_ep_branch1_prep") != nullptr;
@@ -1313,6 +1337,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // following two branch splits can then be submitted together;
             // the router split remains a normal dependency predecessor.
             if (sched->ep_concurrent && ggml_backend_sched_is_ep_branch_node(node) && i > split->i_start) {
+                need_new_split = true;
+            }
+            if (sched->ep_concurrent && ggml_backend_sched_is_ep_join_node(node) && i > split->i_start) {
                 need_new_split = true;
             }
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
@@ -1781,18 +1808,40 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             splits[split_id].backend_id != splits[split_id + 1].backend_id;
 
         if (concurrent_ep_pair) {
-            // Branch-1 routing preparation is assigned to GPU1 during graph
-            // placement.  Submit the two expert branches in order without a
-            // host synchronization between them.
+            GGML_LOG_DEBUG("%s: EP concurrent pair split %d/%d backends %d/%d\n",
+                    __func__, split_id, split_id + 1,
+                    splits[split_id].backend_id, splits[split_id + 1].backend_id);
+            // Prepare both branches before launching either graph.  This keeps
+            // copy/event bookkeeping on the scheduler thread, while the
+            // actual CUDA graph submission happens concurrently below.  A
+            // single scheduler thread can otherwise spend milliseconds
+            // issuing the many small MUL_MAT_ID kernels for branch 0 before it
+            // ever begins submitting branch 1; on P100 that completely
+            // serializes the device timelines even though the CUDA calls are
+            // asynchronous with respect to the host.
             prepare_split(split_id);
-            enum ggml_status ec = launch_split(split_id);
-            if (ec != GGML_STATUS_SUCCESS) {
-                return ec;
-            }
             prepare_split(split_id + 1);
-            ec = launch_split(split_id + 1);
-            if (ec != GGML_STATUS_SUCCESS) {
-                return ec;
+
+            enum ggml_status ec0 = GGML_STATUS_SUCCESS;
+            enum ggml_status ec1 = GGML_STATUS_SUCCESS;
+            std::thread launch0([&] {
+                GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, split_id);
+                ec0 = launch_split(split_id);
+                GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, split_id);
+            });
+            std::thread launch1([&] {
+                GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, split_id + 1);
+                ec1 = launch_split(split_id + 1);
+                GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, split_id + 1);
+            });
+            launch0.join();
+            launch1.join();
+
+            if (ec0 != GGML_STATUS_SUCCESS) {
+                return ec0;
+            }
+            if (ec1 != GGML_STATUS_SUCCESS) {
+                return ec1;
             }
             ++split_id;
         } else {
