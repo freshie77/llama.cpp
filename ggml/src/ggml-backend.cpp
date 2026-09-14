@@ -853,6 +853,16 @@ static bool ggml_backend_sched_is_ep_branch_split(const ggml_backend_sched_split
     return false;
 }
 
+static bool ggml_backend_sched_is_empty_split(const ggml_backend_sched_split * split) {
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        const ggml_tensor * node = split->graph.nodes[i];
+        if (!ggml_is_empty(node) && node->op != GGML_OP_NONE && !ggml_is_view_op(node->op)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // The first ADD after the two local expert branches is the EP join.  Keep it
 // out of the second branch split so the scheduler can submit both branches
 // concurrently and let the normal cross-device input event make the join
@@ -1801,16 +1811,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     };
 
     for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+        // A view-only split can be inserted between the two EP branches by
+        // normal graph partitioning.  It has no device work or dependency of
+        // its own, so do not let it prevent the following real branch from
+        // being submitted with the first branch.
+        int next_ep_split_id = split_id + 1;
+        while (next_ep_split_id < sched->n_splits &&
+               ggml_backend_sched_is_empty_split(&splits[next_ep_split_id])) {
+            ++next_ep_split_id;
+        }
         const bool concurrent_ep_pair = sched->ep_concurrent && !sched->callback_eval &&
-            split_id + 1 < sched->n_splits &&
+            next_ep_split_id < sched->n_splits &&
             ggml_backend_sched_is_ep_branch_split(&splits[split_id]) &&
-            ggml_backend_sched_is_ep_branch_split(&splits[split_id + 1]) &&
-            splits[split_id].backend_id != splits[split_id + 1].backend_id;
+            ggml_backend_sched_is_ep_branch_split(&splits[next_ep_split_id]) &&
+            splits[split_id].backend_id != splits[next_ep_split_id].backend_id;
 
         if (concurrent_ep_pair) {
             GGML_LOG_DEBUG("%s: EP concurrent pair split %d/%d backends %d/%d\n",
-                    __func__, split_id, split_id + 1,
-                    splits[split_id].backend_id, splits[split_id + 1].backend_id);
+                    __func__, split_id, next_ep_split_id,
+                    splits[split_id].backend_id, splits[next_ep_split_id].backend_id);
             // Prepare both branches before launching either graph.  This keeps
             // copy/event bookkeeping on the scheduler thread, while the
             // actual CUDA graph submission happens concurrently below.  A
@@ -1820,7 +1839,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // serializes the device timelines even though the CUDA calls are
             // asynchronous with respect to the host.
             prepare_split(split_id);
-            prepare_split(split_id + 1);
+            prepare_split(next_ep_split_id);
 
             enum ggml_status ec0 = GGML_STATUS_SUCCESS;
             enum ggml_status ec1 = GGML_STATUS_SUCCESS;
@@ -1830,9 +1849,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, split_id);
             });
             std::thread launch1([&] {
-                GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, split_id + 1);
-                ec1 = launch_split(split_id + 1);
-                GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, split_id + 1);
+                GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, next_ep_split_id);
+                ec1 = launch_split(next_ep_split_id);
+                GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, next_ep_split_id);
             });
             launch0.join();
             launch1.join();
@@ -1843,7 +1862,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (ec1 != GGML_STATUS_SUCCESS) {
                 return ec1;
             }
-            ++split_id;
+            split_id = next_ep_split_id;
         } else {
             prepare_split(split_id);
             enum ggml_status ec = launch_split(split_id);
