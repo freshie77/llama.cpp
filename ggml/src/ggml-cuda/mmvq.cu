@@ -889,6 +889,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int     nwarps                = calc_nwarps(type, c_ncols_dst, table_id);
         bool          use                   = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
 
+        // EP keeps a whole 64-expert Q4_K shard local.  Its routed vector
+        // operations are still very thin on Pascal; using the existing
+        // small-k row grouping improves warp utilization for this shape.
+        if (has_ids && nchannels_x == 64 && type == GGML_TYPE_Q4_K) {
+            use = true;
+        }
+
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
             GGML_TYPE_IQ3_XXS,
             GGML_TYPE_IQ3_S,
