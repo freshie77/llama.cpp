@@ -2614,7 +2614,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- layer (default): split layers and KV across GPUs (pipelined)\n"
         "- row: split weight across GPUs by rows (parallelized)\n"
         "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)\n"
-        "- expert: fixed whole-expert parallelism for Qwen3 MoE (2 GPUs, 128 experts)",
+        "- expert: fixed whole-expert parallelism for Qwen3/Qwen3.6 MoE (2 GPUs, even expert count)",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;

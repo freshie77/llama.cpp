@@ -1290,8 +1290,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_tensor t_meta_shard = *t_meta_source;
     ggml_tensor * t_meta = t_meta_source;
     if (expert_shard >= 0) {
-        if (t_meta_source->ne[2] != 128 || expert_shard > 1) {
-            throw std::runtime_error(format("expert-parallel requires 128 experts and shard 0/1 for tensor %s", source_name.c_str()));
+        if (t_meta_source->ne[2] <= 0 || t_meta_source->ne[2] % 2 != 0 || expert_shard > 1) {
+            throw std::runtime_error(format("expert-parallel requires an even expert dimension and shard 0/1 for tensor %s", source_name.c_str()));
         }
         t_meta_shard.ne[2] = t_meta_source->ne[2] / 2;
         t_meta_shard.nb[3] = t_meta_shard.ne[2] * t_meta_shard.nb[2];

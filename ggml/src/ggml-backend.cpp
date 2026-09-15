@@ -885,13 +885,15 @@ struct ggml_backend_sched {
 };
 
 static bool ggml_backend_sched_is_ep_branch_node(const ggml_tensor * node) {
-    if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr || node->src[0]->ne[2] != 64 ||
+    if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr || node->src[0]->ne[2] <= 0 ||
             node->src[1] == nullptr || node->src[1]->ne[2] != 1) {
         return false;
     }
 
     const char * name = ggml_get_name(node->src[0]);
-    return name != nullptr && strstr(name, "ffn_gate_exps") != nullptr;
+    // Only the explicitly-created .ep0/.ep1 tensors are EP branches.  This
+    // keeps the scheduler predicate independent of the model's expert count.
+    return name != nullptr && strstr(name, "ffn_gate_exps") != nullptr && strstr(name, ".ep") != nullptr;
 }
 
 static bool ggml_backend_sched_is_ep_branch_split(const ggml_backend_sched_split * split) {

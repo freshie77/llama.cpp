@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Aggregate LLAMA_EP_TELEMETRY_FILE JSONL routing records.
 
-The CUDA hook records the global top-k IDs before local 64/64 remapping.  This
-tool intentionally keeps the aggregation independent of llama.cpp so the
+The CUDA hook records the global top-k IDs before local half/half remapping.
+This tool intentionally keeps the aggregation independent of llama.cpp so the
 resulting telemetry is easy to archive and inspect.
 """
 
@@ -17,41 +17,47 @@ from typing import Iterable
 
 
 EXPERTS = 128
-SHARD_SIZE = 64
 LAYER_RE = re.compile(r"-(\d+)$")
 
 
-def route_partition(ids: Iterable[int], n_expert_used: int) -> tuple[list[int], int, int]:
+def route_partition(ids: Iterable[int], n_expert_used: int, n_experts: int = EXPERTS) -> tuple[list[int], int, int]:
     """Return local IDs and ownership counts for one token's global routes."""
     global_ids = list(ids)
     if len(global_ids) != n_expert_used:
         raise ValueError("route slot count does not match n_expert_used")
-    if any(expert < 0 or expert >= EXPERTS for expert in global_ids):
-        raise ValueError("global expert ID outside 0..127")
-    local = [expert if expert < SHARD_SIZE else expert - SHARD_SIZE for expert in global_ids]
-    gpu0 = sum(expert < SHARD_SIZE for expert in global_ids)
+    if n_experts <= 0 or n_experts % 2 != 0:
+        raise ValueError("expert count must be a positive even number")
+    shard_size = n_experts // 2
+    if any(expert < 0 or expert >= n_experts for expert in global_ids):
+        raise ValueError(f"global expert ID outside 0..{n_experts - 1}")
+    local = [expert if expert < shard_size else expert - shard_size for expert in global_ids]
+    gpu0 = sum(expert < shard_size for expert in global_ids)
     return local, gpu0, n_expert_used - gpu0
 
 
-def decode_local_route(expert: int, shard: int) -> int:
+def decode_local_route(expert: int, shard: int, n_experts: int = EXPERTS) -> int:
     """Return the decode-kernel local ID, or -1 for a remote route.
 
     The CUDA MMVQ fast path uses -1 as a non-owning-slot sentinel. Keeping
-    this small contract in the telemetry tool makes the fixed 64/64 mapping
+    this small contract in the telemetry tool makes the fixed half/half mapping
     independently testable without requiring two GPUs.
     """
-    if expert < 0 or expert >= EXPERTS:
-        raise ValueError("global expert ID outside 0..127")
+    if n_experts <= 0 or n_experts % 2 != 0:
+        raise ValueError("expert count must be a positive even number")
+    if expert < 0 or expert >= n_experts:
+        raise ValueError(f"global expert ID outside 0..{n_experts - 1}")
     if shard not in (0, 1):
         raise ValueError("EP shard must be 0 or 1")
-    owner = expert // SHARD_SIZE
-    return expert % SHARD_SIZE if owner == shard else -1
+    shard_size = n_experts // 2
+    owner = expert // shard_size
+    return expert % shard_size if owner == shard else -1
 
 
-def aggregate(lines: Iterable[str]) -> dict:
+def aggregate(lines: Iterable[str], n_experts: int = EXPERTS) -> dict:
     layers: dict[str, dict] = {}
     co_selection: collections.Counter[tuple[int, int]] = collections.Counter()
-    total_counts = [0] * EXPERTS
+    shard_size = n_experts // 2
+    total_counts = [0] * n_experts
     total_gpu0 = total_gpu1 = 0
     split_hist = collections.Counter()
     records = 0
@@ -68,7 +74,7 @@ def aggregate(lines: Iterable[str]) -> dict:
         match = LAYER_RE.search(record["tensor"])
         layer = match.group(1) if match else record["tensor"]
         bucket = layers.setdefault(layer, {
-            "selection_count": [0] * EXPERTS,
+            "selection_count": [0] * n_experts,
             "gpu0_selections": 0,
             "gpu1_selections": 0,
             "ownership_split": {f"{i}/{n_used-i}": 0 for i in range(n_used + 1)},
@@ -78,7 +84,7 @@ def aggregate(lines: Iterable[str]) -> dict:
         records += 1
         for token in range(n_tokens):
             token_ids = ids[token * n_used:(token + 1) * n_used]
-            _, gpu0, gpu1 = route_partition(token_ids, n_used)
+            _, gpu0, gpu1 = route_partition(token_ids, n_used, n_experts)
             split_hist[f"{gpu0}/{gpu1}"] += 1
             bucket["ownership_split"][f"{gpu0}/{gpu1}"] += 1
             bucket["gpu0_selections"] += gpu0
@@ -95,8 +101,8 @@ def aggregate(lines: Iterable[str]) -> dict:
 
     hottest = sorted(enumerate(total_counts), key=lambda item: (-item[1], item[0]))
     return {
-        "experts": EXPERTS,
-        "shard_size": SHARD_SIZE,
+        "experts": n_experts,
+        "shard_size": shard_size,
         "records": records,
         "total_gpu0_selections": total_gpu0,
         "total_gpu1_selections": total_gpu1,
@@ -114,8 +120,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--experts", type=int, default=EXPERTS,
+                        help="global expert count (default: 128; use 256 for Qwen3.6)")
     args = parser.parse_args()
-    summary = aggregate(args.input.read_text().splitlines())
+    summary = aggregate(args.input.read_text().splitlines(), args.experts)
     rendered = json.dumps(summary, indent=2, sort_keys=True) + "\n"
     if args.output:
         args.output.write_text(rendered)

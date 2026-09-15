@@ -1252,8 +1252,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool use_mmap_buffer = true;
 
     if (split_mode == LLAMA_SPLIT_MODE_EXPERT) {
-        if ((arch != LLM_ARCH_QWEN3MOE && arch != LLM_ARCH_QWEN3VLMOE) || devices.size() != 2) {
-            throw std::runtime_error("expert split requires Qwen3 MoE/VL MoE with exactly two GPU devices");
+        if ((arch != LLM_ARCH_QWEN3MOE && arch != LLM_ARCH_QWEN3VLMOE && arch != LLM_ARCH_QWEN35MOE) || devices.size() != 2) {
+            throw std::runtime_error("expert split requires Qwen3/Qwen3-VL/Qwen3.6 MoE with exactly two GPU devices");
         }
     }
 
@@ -2770,8 +2770,8 @@ void llama_model_base::create_tensor_moe_expert_shards(llama_layer & layer, int 
     if (params.split_mode != LLAMA_SPLIT_MODE_EXPERT) {
         return;
     }
-    if (n_expert_ != 128) {
-        throw std::runtime_error("expert-parallel Qwen3 v1 requires exactly 128 experts");
+    if (n_expert_ <= 0 || n_expert_ % 2 != 0) {
+        throw std::runtime_error("expert-parallel requires an even positive number of experts");
     }
     for (int shard = 0; shard < 2; ++shard) {
         layer.ffn_gate_exps_ep[shard] = create_tensor_expert_shard(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags, shard);
