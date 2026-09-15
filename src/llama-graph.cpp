@@ -1809,13 +1809,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn_expert_parallel(
            float       w_scale,
     llama_expert_gating_func_type gating_op,
              int       il) const {
-    if (n_expert != 128 || n_expert_used <= 0 || gating_op != LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX ||
+    if (n_expert <= 0 || n_expert % 2 != 0 || n_expert_used <= 0 || gating_op != LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX ||
             type_op != LLM_FFN_SILU || up_exps[0] == nullptr || up_exps[1] == nullptr ||
             gate_exps[0] == nullptr || gate_exps[1] == nullptr || down_exps[0] == nullptr || down_exps[1] == nullptr) {
         GGML_ABORT("expert-parallel Qwen3 path received unsupported MoE tensors");
     }
 
     const int64_t n_embd   = cur->ne[0];
+    const int64_t experts_per_shard = n_expert / 2;
     const int64_t n_tokens = cur->ne[1];
     ggml_tensor * logits = build_lora_mm(gate_inp, cur);
     cb(logits, "ffn_moe_ep_logits", il);
@@ -1853,22 +1854,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn_expert_parallel(
     // branch inputs to be ready before either expert graph is submitted.
     for (int shard = 0; shard < 2; ++shard) {
         // The ids remain global until this point.  Each branch clamps its
-        // local ids to [0,63] and zeros the weight for routes it does not own.
+        // local ids to [0, experts_per_shard) and zeros the weight for routes
+        // it does not own.
         ggml_tensor * ids_f32 = ggml_cast(ctx0, selected, GGML_TYPE_F32);
         ggml_tensor * local_ids_f32;
         ggml_tensor * owned_f32;
         if (shard == 0) {
-            owned_f32 = ggml_step(ctx0, ggml_add1(ctx0, ggml_scale(ctx0, ids_f32, -1.0f), ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 63.5f)));
-            local_ids_f32 = ggml_clamp(ctx0, ids_f32, 0.0f, 63.0f);
+            owned_f32 = ggml_step(ctx0, ggml_add1(ctx0, ggml_scale(ctx0, ids_f32, -1.0f), ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), experts_per_shard - 0.5f)));
+            local_ids_f32 = ggml_clamp(ctx0, ids_f32, 0.0f, experts_per_shard - 1.0f);
         } else {
-            local_ids_f32 = ggml_clamp(ctx0, ggml_add1(ctx0, ids_f32, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -64.0f)), 0.0f, 63.0f);
-            owned_f32 = ggml_step(ctx0, ggml_add1(ctx0, ids_f32, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -63.5f)));
+            local_ids_f32 = ggml_clamp(ctx0, ggml_add1(ctx0, ids_f32, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -experts_per_shard)), 0.0f, experts_per_shard - 1.0f);
+            owned_f32 = ggml_step(ctx0, ggml_add1(ctx0, ids_f32, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -(experts_per_shard - 0.5f))));
         }
         // Decode has one token, so the CUDA MMVQ kernel can cheaply skip a
         // routed slot whose owner is the other GPU.  Prefill keeps the valid
-        // [0,63] IDs required by the generic grouped-MATMUL paths.
+        // [0, experts_per_shard) IDs required by the generic grouped-MATMUL
+        // paths.
         if (n_tokens == 1) {
-            const float sentinel_delta = shard == 0 ? 64.0f : 1.0f;
+            const float sentinel_delta = shard == 0 ? experts_per_shard : 1.0f;
             ggml_tensor * not_owned = ggml_add1(ctx0, owned_f32,
                     ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -1.0f));
             local_ids_f32 = ggml_add(ctx0, local_ids_f32, ggml_scale(ctx0, not_owned, sentinel_delta));

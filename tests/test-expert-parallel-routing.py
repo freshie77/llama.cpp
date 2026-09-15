@@ -34,6 +34,15 @@ def test_telemetry_preserves_duplicate_local_slots():
     assert summary["layers"]["7"]["records"] == 1
 
 
+def test_qwen36_256_expert_mapping_uses_128_expert_shards():
+    local, gpu0, gpu1 = MODULE.route_partition([0, 127, 128, 255], 4, 256)
+    assert local == [0, 127, 0, 127]
+    assert (gpu0, gpu1) == (2, 2)
+    assert MODULE.decode_local_route(127, 0, 256) == 127
+    assert MODULE.decode_local_route(128, 0, 256) == -1
+    assert MODULE.decode_local_route(255, 1, 256) == 127
+
+
 def test_invalid_route_fails_closed():
     try:
         MODULE.route_partition([0, 128], 2)

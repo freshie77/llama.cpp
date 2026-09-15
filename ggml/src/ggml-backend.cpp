@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -772,6 +775,54 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// A single reusable host worker avoids constructing two OS threads for every
+// EP branch pair while retaining the explicit join before the next scheduler
+// dependency.  The worker only owns the host-side CUDA submission call; CUDA
+// stream/event ordering remains the source of truth for device dependencies.
+struct ggml_backend_sched_ep_launch_state {
+    std::mutex mutex;
+    std::condition_variable work_available;
+    std::condition_variable work_done;
+    std::function<enum ggml_status()> task;
+    std::thread worker;
+    bool stopping = false;
+    bool has_task = false;
+    bool done = true;
+    enum ggml_status result = GGML_STATUS_SUCCESS;
+
+    ggml_backend_sched_ep_launch_state() : worker([this] {
+        for (;;) {
+            std::function<enum ggml_status()> task_to_run;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                work_available.wait(lock, [this] { return stopping || has_task; });
+                if (stopping) {
+                    return;
+                }
+                task_to_run = std::move(task);
+                has_task = false;
+            }
+
+            const enum ggml_status result_to_publish = task_to_run();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                result = result_to_publish;
+                done = true;
+            }
+            work_done.notify_one();
+        }
+    }) {}
+
+    ~ggml_backend_sched_ep_launch_state() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        work_available.notify_one();
+        worker.join();
+    }
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -779,6 +830,7 @@ struct ggml_backend_sched {
     // branches.  Keep this opt-in so ordinary layer/tensor scheduling keeps
     // its existing ordering semantics.
     bool ep_concurrent;
+    ggml_backend_sched_ep_launch_state * ep_launch_state;
 
     int n_backends;
 
@@ -833,13 +885,15 @@ struct ggml_backend_sched {
 };
 
 static bool ggml_backend_sched_is_ep_branch_node(const ggml_tensor * node) {
-    if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr || node->src[0]->ne[2] != 64 ||
+    if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr || node->src[0]->ne[2] <= 0 ||
             node->src[1] == nullptr || node->src[1]->ne[2] != 1) {
         return false;
     }
 
     const char * name = ggml_get_name(node->src[0]);
-    return name != nullptr && strstr(name, "ffn_gate_exps") != nullptr;
+    // Only the explicitly-created .ep0/.ep1 tensors are EP branches.  This
+    // keeps the scheduler predicate independent of the model's expert count.
+    return name != nullptr && strstr(name, "ffn_gate_exps") != nullptr && strstr(name, ".ep") != nullptr;
 }
 
 static bool ggml_backend_sched_is_ep_branch_split(const ggml_backend_sched_split * split) {
@@ -851,6 +905,16 @@ static bool ggml_backend_sched_is_ep_branch_split(const ggml_backend_sched_split
         return ggml_backend_sched_is_ep_branch_node(node);
     }
     return false;
+}
+
+static bool ggml_backend_sched_is_empty_split(const ggml_backend_sched_split * split) {
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        const ggml_tensor * node = split->graph.nodes[i];
+        if (!ggml_is_empty(node) && node->op != GGML_OP_NONE && !ggml_is_view_op(node->op)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // The first ADD after the two local expert branches is the EP join.  Keep it
@@ -1621,6 +1685,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        // All split inputs are submitted to the same destination stream.  A
+        // single wait for the previous evaluation therefore protects every
+        // destination copy; repeating it for each input only adds scheduler
+        // overhead.  Keep source-backend synchronization below for
+        // synchronous cross-backend copies, where it remains part of the copy
+        // contract.
+        bool split_backend_ready = false;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1638,10 +1709,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                if (sched->events[split_backend_id][sched->cur_copy] != NULL && !split_backend_ready) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
+                    split_backend_ready = true;
+                } else if (sched->events[split_backend_id][sched->cur_copy] == NULL && !split_backend_ready) {
                     ggml_backend_synchronize(split_backend);
+                    split_backend_ready = true;
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1736,8 +1809,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                        } else {
-                            ggml_backend_synchronize(split_backend);
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
@@ -1801,16 +1872,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     };
 
     for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+        if (ggml_backend_sched_is_empty_split(&splits[split_id])) {
+            continue;
+        }
+
+        // A view-only split can be inserted between the two EP branches by
+        // normal graph partitioning.  It has no device work or dependency of
+        // its own, so do not let it prevent the following real branch from
+        // being submitted with the first branch.
+        int next_ep_split_id = split_id + 1;
+        while (next_ep_split_id < sched->n_splits &&
+               ggml_backend_sched_is_empty_split(&splits[next_ep_split_id])) {
+            ++next_ep_split_id;
+        }
         const bool concurrent_ep_pair = sched->ep_concurrent && !sched->callback_eval &&
-            split_id + 1 < sched->n_splits &&
+            next_ep_split_id < sched->n_splits &&
             ggml_backend_sched_is_ep_branch_split(&splits[split_id]) &&
-            ggml_backend_sched_is_ep_branch_split(&splits[split_id + 1]) &&
-            splits[split_id].backend_id != splits[split_id + 1].backend_id;
+            ggml_backend_sched_is_ep_branch_split(&splits[next_ep_split_id]) &&
+            splits[split_id].backend_id != splits[next_ep_split_id].backend_id;
 
         if (concurrent_ep_pair) {
             GGML_LOG_DEBUG("%s: EP concurrent pair split %d/%d backends %d/%d\n",
-                    __func__, split_id, split_id + 1,
-                    splits[split_id].backend_id, splits[split_id + 1].backend_id);
+                    __func__, split_id, next_ep_split_id,
+                    splits[split_id].backend_id, splits[next_ep_split_id].backend_id);
             // Prepare both branches before launching either graph.  This keeps
             // copy/event bookkeeping on the scheduler thread, while the
             // actual CUDA graph submission happens concurrently below.  A
@@ -1820,22 +1904,37 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // serializes the device timelines even though the CUDA calls are
             // asynchronous with respect to the host.
             prepare_split(split_id);
-            prepare_split(split_id + 1);
+            prepare_split(next_ep_split_id);
 
+            // Keep the scheduler thread submitting one branch while the
+            // reusable helper submits the sibling.  The helper is joined
+            // before the scheduler advances to the dependent join/next layer.
             enum ggml_status ec0 = GGML_STATUS_SUCCESS;
+            {
+                ggml_backend_sched_ep_launch_state * ep_launch = sched->ep_launch_state;
+                GGML_ASSERT(ep_launch != nullptr);
+                std::lock_guard<std::mutex> lock(ep_launch->mutex);
+                GGML_ASSERT(!ep_launch->has_task && ep_launch->done);
+                ep_launch->task = [&] {
+                    GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, next_ep_split_id);
+                    enum ggml_status ec = launch_split(next_ep_split_id);
+                    GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, next_ep_split_id);
+                    return ec;
+                };
+                ep_launch->done = false;
+                ep_launch->has_task = true;
+                ep_launch->work_available.notify_one();
+            }
+            GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, split_id);
+            ec0 = launch_split(split_id);
+            GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, split_id);
+
             enum ggml_status ec1 = GGML_STATUS_SUCCESS;
-            std::thread launch0([&] {
-                GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, split_id);
-                ec0 = launch_split(split_id);
-                GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, split_id);
-            });
-            std::thread launch1([&] {
-                GGML_LOG_DEBUG("%s: EP launch split %d begin\n", __func__, split_id + 1);
-                ec1 = launch_split(split_id + 1);
-                GGML_LOG_DEBUG("%s: EP launch split %d end\n", __func__, split_id + 1);
-            });
-            launch0.join();
-            launch1.join();
+            {
+                std::unique_lock<std::mutex> lock(sched->ep_launch_state->mutex);
+                sched->ep_launch_state->work_done.wait(lock, [&] { return sched->ep_launch_state->done; });
+                ec1 = sched->ep_launch_state->result;
+            }
 
             if (ec0 != GGML_STATUS_SUCCESS) {
                 return ec0;
@@ -1843,7 +1942,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (ec1 != GGML_STATUS_SUCCESS) {
                 return ec1;
             }
-            ++split_id;
+            split_id = next_ep_split_id;
         } else {
             prepare_split(split_id);
             enum ggml_status ec = launch_split(split_id);
@@ -1928,6 +2027,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_set_ep_concurrent(ggml_backend_sched_t sched, bool enabled) {
     GGML_ASSERT(sched);
     sched->ep_concurrent = enabled;
+    if (enabled && sched->ep_launch_state == nullptr) {
+        sched->ep_launch_state = new ggml_backend_sched_ep_launch_state();
+    }
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
@@ -1939,6 +2041,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->events[b][c]);
         }
     }
+    delete sched->ep_launch_state;
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);

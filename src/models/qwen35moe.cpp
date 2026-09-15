@@ -96,8 +96,14 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         // Routed experts
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        if (params.split_mode == LLAMA_SPLIT_MODE_EXPERT) {
+            // Keep each routed expert whole on one GPU.  The loader creates
+            // two local half-width views of each original expert tensor.
+            create_tensor_moe_expert_shards(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        } else {
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
+            create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        }
 
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
@@ -123,8 +129,12 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         // Routed experts
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, 0);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, 0);
+        if (params.split_mode == LLAMA_SPLIT_MODE_EXPERT) {
+            create_tensor_moe_expert_shards(layer, il, n_embd, n_ff_exp, n_expert, 0);
+        } else {
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
+            create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, 0);
+        }
 
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
@@ -497,21 +507,28 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    ggml_tensor * moe_out =
+    ggml_tensor * moe_out = model.split_mode() == LLAMA_SPLIT_MODE_EXPERT ?
+        build_moe_ffn_expert_parallel(cur, model.layers[il].ffn_gate_inp,
+                model.layers[il].ffn_up_exps_ep,
+                model.layers[il].ffn_gate_exps_ep,
+                model.layers[il].ffn_down_exps_ep,
+                n_expert, n_expert_used, LLM_FFN_SILU, true,
+                hparams.expert_weights_scale,
+                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il) :
         build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
-            nullptr,
-            n_expert, n_expert_used,
-            LLM_FFN_SILU, true,
-            hparams.expert_weights_scale,
-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+                model.layers[il].ffn_gate_inp,
+                model.layers[il].ffn_up_exps,
+                model.layers[il].ffn_gate_exps,
+                model.layers[il].ffn_down_exps,
+                nullptr,
+                n_expert, n_expert_used,
+                LLM_FFN_SILU, true,
+                hparams.expert_weights_scale,
+                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+                nullptr, model.layers[il].ffn_gate_up_exps,
+                model.layers[il].ffn_up_exps_s,
+                model.layers[il].ffn_gate_exps_s,
+                model.layers[il].ffn_down_exps_s);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation
@@ -675,21 +692,28 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(cur, "mtp_attn_post_norm", il);
 
     // MoE FFN — routed experts plus gated shared expert (mirrors qwen35moe).
-    ggml_tensor * moe_out =
+    ggml_tensor * moe_out = model.split_mode() == LLAMA_SPLIT_MODE_EXPERT ?
+        build_moe_ffn_expert_parallel(cur, layer.ffn_gate_inp,
+                layer.ffn_up_exps_ep,
+                layer.ffn_gate_exps_ep,
+                layer.ffn_down_exps_ep,
+                n_expert, n_expert_used, LLM_FFN_SILU, true,
+                hparams.expert_weights_scale,
+                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il) :
         build_moe_ffn(cur,
-            layer.ffn_gate_inp,
-            layer.ffn_up_exps,
-            layer.ffn_gate_exps,
-            layer.ffn_down_exps,
-            nullptr,
-            n_expert, n_expert_used,
-            LLM_FFN_SILU, true,
-            hparams.expert_weights_scale,
-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, layer.ffn_gate_up_exps,
-            layer.ffn_up_exps_s,
-            layer.ffn_gate_exps_s,
-            layer.ffn_down_exps_s);
+                layer.ffn_gate_inp,
+                layer.ffn_up_exps,
+                layer.ffn_gate_exps,
+                layer.ffn_down_exps,
+                nullptr,
+                n_expert, n_expert_used,
+                LLM_FFN_SILU, true,
+                hparams.expert_weights_scale,
+                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+                nullptr, layer.ffn_gate_up_exps,
+                layer.ffn_up_exps_s,
+                layer.ffn_gate_exps_s,
+                layer.ffn_down_exps_s);
     cb(moe_out, "mtp_ffn_moe_out", il);
 
     if (layer.ffn_up_shexp != nullptr) {

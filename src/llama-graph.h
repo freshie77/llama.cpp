@@ -1019,8 +1019,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
 
-    // Qwen3 MoE proof-of-concept: each branch owns complete experts 0:64 or
-    // 64:128.  The router remains global and is evaluated exactly once.
+    // Qwen3 MoE proof-of-concept: each branch owns a complete half of the
+    // experts.  The router remains global and is evaluated exactly once.
     ggml_tensor * build_moe_ffn_expert_parallel(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,

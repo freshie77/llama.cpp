@@ -1,14 +1,15 @@
-# Qwen3-VL fixed expert parallelism (P100 proof of concept)
+# Qwen3 fixed expert parallelism (P100 proof of concept)
 
 This isolated branch adds `--split-mode expert` (alias `ep`) for exactly two
-CUDA devices and the Qwen3/Qwen3-VL MoE model used on the T7910.  It is not a
+CUDA devices and the Qwen3/Qwen3-VL/Qwen3.6 MoE models used on the T7910.  It is not a
 fallback: unsupported architectures or device counts fail during model load.
 
 ## Placement and execution
 
-Every 128-expert gate/up/down tensor is loaded as two local 64-expert tensors.
-Experts `0..63` are resident on CUDA device 0 and experts `64..127` on device
-1.  The router still produces global top-8 IDs and the original routing
+Every even-sized expert gate/up/down tensor is loaded as two local half-sized
+tensors.  For the existing Qwen3-VL model this is 64/64; for Qwen3.6 it is
+128/128.  The lower half is resident on CUDA device 0 and the upper half on
+device 1.  The router still produces global top-8 IDs and the original routing
 weights.  Each branch remaps IDs to its local namespace, masks routes it does
 not own, evaluates whole local experts with `MUL_MAT_ID`, and the two weighted
 partial sums are added.  This is whole-expert sharding; the expert matrices
@@ -46,7 +47,7 @@ it with:
 python3 tools/ep_telemetry.py /path/routes.jsonl --output /path/routes.json
 ```
 
-The JSON includes per-layer 128-expert selection counts, GPU ownership totals,
+The JSON includes per-layer expert selection counts, GPU ownership totals,
 the 8/0 through 0/8 token split histogram, and co-selection counts.
 
 ## Validation scope
